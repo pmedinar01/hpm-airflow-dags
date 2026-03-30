@@ -1,5 +1,5 @@
 from airflow import DAG
-from airflow.operators.bash import BashOperator  # <--- Corregido 'operators'
+from airflow.operators.bash import BashOperator
 from datetime import datetime, timedelta
 
 default_args = {
@@ -11,11 +11,12 @@ default_args = {
 with DAG(
     'test_github_sync_v1',
     default_args=default_args,
-    schedule_interval=None, # Lo activaremos manualmente para probar
+    schedule=None,  # <--- Corregido para Airflow 3.x
     catchup=False,
+    tags=['cern', 'test']
 ) as dag:
 
     t1 = BashOperator(
         task_id='confirmacion_cern',
-        bash_command='echo "Sincronización correcta en el nodo del CERN"',
+        bash_command='echo "Sincronización y sintaxis correctas en Airflow 3.x"',
     )
