@@ -56,13 +56,13 @@ def eos_ns_latency_tests():
         testdir = f'/eos/{eos_dirname}/opstest/graphite/'
         env = {**os.environ, **EOS_ENV}
         result = subprocess.run(
-            ['eos', EOS_MGM, 'ls', testdir],
+            ['eos', '-r', '0', '0', EOS_MGM, 'ls', testdir],
             capture_output=True, text=True, env=env,
         )
         if result.returncode != 0:
             log.info('Directory %s does not exist, creating...', testdir)
             mkdir_result = subprocess.run(
-                ['eos', EOS_MGM, 'mkdir', '-p', testdir],
+                ['eos', '-r', '0', '0', EOS_MGM, 'mkdir', '-p', testdir],
                 capture_output=True, text=True, env=env,
             )
             if mkdir_result.returncode != 0:
@@ -75,7 +75,6 @@ def eos_ns_latency_tests():
     def collect_ns_metrics(testdir: str, **context) -> dict:
         """Run EOS commands (mkdir/ls/rmdir, touch/rm, whoami) and measure their latency."""
         instance = context['params']['instance']
-        ROLE = 'dteam001 cg'
         env = {**os.environ, **EOS_ENV}
         commands = {
             'dir':   ['mkdir', 'ls', 'rmdir'],
@@ -86,9 +85,9 @@ def eos_ns_latency_tests():
         for cmd_type, cmds in commands.items():
             for cmd in cmds:
                 if cmd_type != 'other':
-                    args = ['eos', '--batch', '--role', ROLE, EOS_MGM, cmd, testdir + '/test_' + cmd_type]
+                    args = ['eos', '-r', '0', '0', EOS_MGM, cmd, testdir + '/test_' + cmd_type]
                 else:
-                    args = ['eos', '--batch', '--role', ROLE, EOS_MGM, cmd]
+                    args = ['eos', '-r', '0', '0', EOS_MGM, cmd]
                 log.info('Running: %s', ' '.join(args))
                 before = time.time()
                 proc = subprocess.run(args, capture_output=True, text=True, env=env)
