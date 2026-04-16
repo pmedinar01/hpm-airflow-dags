@@ -2,12 +2,18 @@ from airflow.decorators import dag, task
 from airflow.models.param import Param
 from datetime import datetime, timedelta
 import logging
-import re
+import os
 import subprocess
 import time
 import requests
 
 log = logging.getLogger(__name__)
+
+EOS_MGM = 'root://eoshomedev.cern.ch'
+EOS_ENV = {
+    'XrdSecPROTOCOL': 'sss',
+    'XrdSecSSSKT': '/etc/eos.keytab',
+}
 
 PROMHOST = "eos-prometheus.cern.ch:9091"
 PROMTIMEOUT = 30
@@ -43,32 +49,24 @@ default_args = {
 def eos_ns_latency_tests():
 
     @task()
-    def check_is_master():
-        """Verify that this node is the MGM master (mode=master-rw or is_master=true)."""
-        p = subprocess.run(['eos', '-b', 'ns'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out = p.stdout.decode('utf-8')
-        log.info('eos -b ns output:\n%s', out)
-        for line in out.splitlines():
-            if re.search(r'Replication\s+(mode=master-rw|is_master=true)', line):
-                log.info('This node is the MGM master.')
-                return True
-        raise RuntimeError('This node is not the MGM master. Aborting.')
-
-    @task()
     def ensure_testdir(**context) -> str:
         """Create the EOS test directory if it does not exist and return its path."""
         instance = context['params']['instance']
         eos_dirname = instance[3:] if instance.startswith('eos') else instance
         testdir = f'/eos/{eos_dirname}/opstest/graphite/'
-        result = subprocess.run(['eos', 'ls', testdir], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = {**os.environ, **EOS_ENV}
+        result = subprocess.run(
+            ['eos', EOS_MGM, 'ls', testdir],
+            capture_output=True, text=True, env=env,
+        )
         if result.returncode != 0:
             log.info('Directory %s does not exist, creating...', testdir)
             mkdir_result = subprocess.run(
-                ['eos', 'mkdir', '-p', testdir],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ['eos', EOS_MGM, 'mkdir', '-p', testdir],
+                capture_output=True, text=True, env=env,
             )
             if mkdir_result.returncode != 0:
-                log.error('Could not create directory %s: %s', testdir, mkdir_result.stderr.decode())
+                log.error('Could not create directory %s: %s', testdir, mkdir_result.stderr)
         else:
             log.info('Directory %s already exists.', testdir)
         return testdir
@@ -78,7 +76,7 @@ def eos_ns_latency_tests():
         """Run EOS commands (mkdir/ls/rmdir, touch/rm, whoami) and measure their latency."""
         instance = context['params']['instance']
         ROLE = 'dteam001 cg'
-        URL = 'root://' + instance + '/'
+        env = {**os.environ, **EOS_ENV}
         commands = {
             'dir':   ['mkdir', 'ls', 'rmdir'],
             'file':  ['touch', 'rm'],
@@ -88,16 +86,19 @@ def eos_ns_latency_tests():
         for cmd_type, cmds in commands.items():
             for cmd in cmds:
                 if cmd_type != 'other':
-                    args = ['eos', '--batch', '--role', ROLE, URL, cmd, testdir + '/test_' + cmd_type]
+                    args = ['eos', '--batch', '--role', ROLE, EOS_MGM, cmd, testdir + '/test_' + cmd_type]
                 else:
-                    args = ['eos', '--batch', '--role', ROLE, URL, cmd]
+                    args = ['eos', '--batch', '--role', ROLE, EOS_MGM, cmd]
                 log.info('Running: %s', ' '.join(args))
                 before = time.time()
-                proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                proc = subprocess.run(args, capture_output=True, text=True, env=env)
                 duration = time.time() - before
                 if proc.returncode != 0:
                     duration = -duration
-                    log.error('ERROR running %s: %s', ' '.join(args), proc.stderr.decode())
+                    log.error('ERROR running %s: %s', ' '.join(args), proc.stderr)
+                else:
+                    if proc.stdout:
+                        log.info('stdout: %s', proc.stdout)
                 key = f'{cmd_type}.{cmd}'
                 metrics[key] = duration
                 log.info('%s: %.4f s', key, duration)
@@ -119,12 +120,9 @@ def eos_ns_latency_tests():
         log.info('Metrics pushed successfully (HTTP %d)', r.status_code)
 
     # Pipeline
-    master_ok = check_is_master()
     testdir = ensure_testdir()
     metrics = collect_ns_metrics(testdir)
-    push = push_to_prometheus(metrics)
-
-    master_ok >> testdir >> metrics >> push
+    push_to_prometheus(metrics)
 
 
 eos_ns_latency_tests()
