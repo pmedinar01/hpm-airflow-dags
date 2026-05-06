@@ -1,5 +1,4 @@
 from airflow.decorators import dag, task
-from airflow.models.param import Param
 from datetime import datetime, timedelta
 import logging
 import os
@@ -9,18 +8,20 @@ import requests
 
 log = logging.getLogger(__name__)
 
-EOS_MGM = 'root://eoshomedev.cern.ch'
+EOS_MGM     = 'root://eoshomedev.cern.ch'
+EOS_TESTDIR = '/eos/homedev.cern.ch/opstest/graphite'
 EOS_ENV = {
     'XrdSecPROTOCOL': 'sss',
     'XrdSecSSSKT': '/etc/eos.keytab',
 }
 
-PROMHOST = "eos-prometheus.cern.ch:9091"
-PROMTIMEOUT = 30
-PROMMETRIC_LATENCY = "eos_ns_latency"
-PROMMETRIC_LATENCY_HELP = (
-    f"# TYPE {PROMMETRIC_LATENCY} gauge\n"
-    f"# HELP {PROMMETRIC_LATENCY} EOS latency and state metrics\n"
+PROM_HOST     = 'eos-prometheus.cern.ch:9091'
+PROM_TIMEOUT  = 30
+PROM_JOB      = 'eos_ns_latency'
+PROM_INSTANCE = 'eoshomedev.cern.ch'
+PROM_HELP = (
+    f'# TYPE {PROM_JOB} gauge\n'
+    f'# HELP {PROM_JOB} EOS namespace latency metrics\n'
 )
 
 default_args = {
@@ -34,6 +35,16 @@ default_args = {
 }
 
 
+def eos_run(*args):
+    """Run an EOS command against EOS_MGM and return the CompletedProcess."""
+    cmd = ['eos', '-r', '0', '0', EOS_MGM] + list(args)
+    log.info('Running: %s', ' '.join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **EOS_ENV})
+    if result.returncode != 0:
+        log.error('stderr: %s', result.stderr.strip())
+    return result
+
+
 @dag(
     dag_id='eos_ns_latency_tests',
     default_args=default_args,
@@ -42,40 +53,21 @@ default_args = {
     start_date=datetime(2024, 1, 1),
     catchup=False,
     tags=['eos', 'monitoring', 'prometheus'],
-    params={
-        'instance': Param('eoshomedev.cern.ch', type='string', description='EOS instance to monitor'),
-    },
 )
 def eos_ns_latency_tests():
 
     @task()
-    def ensure_testdir(**context) -> str:
-        """Create the EOS test directory if it does not exist and return its path."""
-        instance = context['params']['instance']
-        eos_dirname = instance[3:] if instance.startswith('eos') else instance
-        testdir = f'/eos/{eos_dirname}/opstest/graphite/'
-        env = {**os.environ, **EOS_ENV}
-        result = subprocess.run(
-            ['eos', '-r', '0', '0', EOS_MGM, 'ls', testdir],
-            capture_output=True, text=True, env=env,
-        )
-        if result.returncode != 0:
-            log.info('Directory %s does not exist, creating...', testdir)
-            mkdir_result = subprocess.run(
-                ['eos', '-r', '0', '0', EOS_MGM, 'mkdir', '-p', testdir],
-                capture_output=True, text=True, env=env,
-            )
-            if mkdir_result.returncode != 0:
-                log.error('Could not create directory %s: %s', testdir, mkdir_result.stderr)
+    def ensure_testdir():
+        """Create the EOS test directory if it does not exist."""
+        if eos_run('ls', EOS_TESTDIR).returncode != 0:
+            log.info('Directory %s not found, creating...', EOS_TESTDIR)
+            eos_run('mkdir', '-p', EOS_TESTDIR)
         else:
-            log.info('Directory %s already exists.', testdir)
-        return testdir
+            log.info('Directory %s already exists.', EOS_TESTDIR)
 
     @task()
-    def collect_ns_metrics(testdir: str, **context) -> dict:
-        """Run EOS commands (mkdir/ls/rmdir, touch/rm, whoami) and measure their latency."""
-        instance = context['params']['instance']
-        env = {**os.environ, **EOS_ENV}
+    def collect_ns_metrics() -> dict:
+        """Run EOS namespace commands and measure latency for each."""
         commands = {
             'dir':   ['mkdir', 'ls', 'rmdir'],
             'file':  ['touch', 'rm'],
@@ -84,44 +76,41 @@ def eos_ns_latency_tests():
         metrics = {}
         for cmd_type, cmds in commands.items():
             for cmd in cmds:
-                if cmd_type != 'other':
-                    args = ['eos', '-r', '0', '0', EOS_MGM, cmd, testdir + '/test_' + cmd_type]
-                else:
-                    args = ['eos', '-r', '0', '0', EOS_MGM, cmd]
-                log.info('Running: %s', ' '.join(args))
+                args = [cmd, f'{EOS_TESTDIR}/test_{cmd_type}'] if cmd_type != 'other' else [cmd]
                 before = time.time()
-                proc = subprocess.run(args, capture_output=True, text=True, env=env)
+                result = eos_run(*args)
                 duration = time.time() - before
-                if proc.returncode != 0:
+                if result.returncode != 0:
                     duration = -duration
-                    log.error('ERROR running %s: %s', ' '.join(args), proc.stderr)
-                else:
-                    if proc.stdout:
-                        log.info('stdout: %s', proc.stdout)
                 key = f'{cmd_type}.{cmd}'
                 metrics[key] = duration
                 log.info('%s: %.4f s', key, duration)
         return metrics
 
     @task()
-    def push_to_prometheus(metrics: dict, **context):
-        """Push metrics to the Prometheus pushgateway."""
-        instance = context['params']['instance']
-        job = PROMMETRIC_LATENCY
-        headers = {'X-Requested-With': 'Python requests', 'Content-type': 'text/xml'}
-        url = f'http://{PROMHOST}/metrics/job/{job}/instance/{instance}'
-        data = PROMMETRIC_LATENCY_HELP
-        for k, v in metrics.items():
-            data += f'{job}{{cluster="{instance}", instance="{instance}", tag="{k}"}} {v}\n'
-        log.info('Pushing metrics to %s:\n%s', url, data)
-        r = requests.post(url, headers=headers, data=data, timeout=PROMTIMEOUT)
+    def push_to_prometheus(metrics: dict):
+        """Push latency metrics to the Prometheus pushgateway."""
+        url = f'http://{PROM_HOST}/metrics/job/{PROM_JOB}/instance/{PROM_INSTANCE}'
+        body = PROM_HELP + ''.join(
+            f'{PROM_JOB}{{cluster="{PROM_INSTANCE}", instance="{PROM_INSTANCE}", tag="{k}"}} {v}\n'
+            for k, v in metrics.items()
+        )
+        log.info('Pushing to %s:\n%s', url, body)
+        r = requests.post(
+            url,
+            headers={'X-Requested-With': 'Python requests', 'Content-type': 'text/xml'},
+            data=body,
+            timeout=PROM_TIMEOUT,
+        )
         r.raise_for_status()
-        log.info('Metrics pushed successfully (HTTP %d)', r.status_code)
+        log.info('Done (HTTP %d)', r.status_code)
 
     # Pipeline
     testdir = ensure_testdir()
-    metrics = collect_ns_metrics(testdir)
+    metrics = collect_ns_metrics()
     push_to_prometheus(metrics)
+
+    testdir >> metrics
 
 
 eos_ns_latency_tests()

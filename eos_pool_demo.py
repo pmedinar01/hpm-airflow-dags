@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import logging
 import os
 import subprocess
+import time
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ def eos_pool_demo_parallel():
     def touch_file(index: int):
         path = f'{EOS_BASE}/parallel_{index}.txt'
         eos_run('touch', path)
+        time.sleep(15)  # slow down so pool throttling is visible in the UI
         return path
 
     @task(pool=POOL)
